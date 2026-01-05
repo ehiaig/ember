@@ -1,0 +1,14 @@
+# Validation Spike - Requirements
+# ================================
+
+# Browser Automation
+playwright>=1.40.0
+
+# Microsoft Authentication Library for Device Code Flow
+msal>=1.25.0
+
+# HTTP requests for Graph API calls
+requests>=2.31.0
+
+# For PyInstaller compilation
+pyinstaller>=6.0.0
