@@ -32,8 +32,8 @@ CONFIG = {
     "TARGET_MAILBOX": "samco@emberapp.io", 
 
     # Microsoft Graph (Azure CLI Public Client - Safe for Enterprise)
-    "MS_CLIENT_ID": "04b07795-8ddb-461a-bbee-02f9e1bf7b46",
-    "MS_TENANT_ID": "common",
+    "MS_CLIENT_ID": "268bea51-ff50-4d3d-b09d-396cfad6764d",
+    "MS_TENANT_ID": "bd18e10f-0f57-4b5e-813d-98086df34ca1",
 }
 
 # =============================================================================
