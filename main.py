@@ -167,7 +167,7 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         browser.close()
 
 # =============================================================================
-# EMAIL LOGIC (SHARED MAILBOX)
+# UPDATED EMAIL LOGIC (Targeting "(Web)" links specifically)
 # =============================================================================
 def run_email_validation(password, log_callback, status_callback, code_callback):
     import re
@@ -180,7 +180,7 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
     log_callback(f"Target Inbox: {CONFIG['TARGET_MAILBOX']}")
     log_callback("="*50)
     
-    # 1. Auth Flow (Same as before)
+    # 1. Auth Flow
     app = msal.PublicClientApplication(
         client_id=CONFIG["MS_CLIENT_ID"],
         authority=f"https://login.microsoftonline.com/{CONFIG['MS_TENANT_ID']}"
@@ -201,10 +201,9 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
         
     log_callback("Auth Success! Fetching email body...")
     
-    # 2. Query Message WITH Body Preview (to find the link)
+    # 2. Query Message
     headers = {"Authorization": f"Bearer {result['access_token']}"}
-    # We ask for 'bodyPreview' and 'body' to hunt for the link
-    endpoint = f"https://graph.microsoft.com/v1.0/users/{CONFIG['TARGET_MAILBOX']}/messages?$top=1&$select=subject,from,body,bodyPreview"
+    endpoint = f"https://graph.microsoft.com/v1.0/users/{CONFIG['TARGET_MAILBOX']}/messages?$top=1&$select=subject,from,body"
     
     resp = requests.get(endpoint, headers=headers)
     
@@ -213,35 +212,41 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
         if data.get("value"):
             email = data["value"][0]
             subject = email.get('subject')
-            body_content = email.get('body', {}).get('content', '') + email.get('bodyPreview', '')
+            # Get the full HTML content of the email
+            body_content = email.get('body', {}).get('content', '')
             
             log_callback("\n" + "="*50)
             log_callback("SUCCESS! Email Found.")
             log_callback(f"Subject: {subject}")
             
-            # --- LINK EXTRACTION LOGIC ---
-            # Looks for http links containing 'findox' or 'mimecast'
-            # Regex explanation: http(s):// (not space or quote)* (findox or mimecast) (not space or quote)*
-            link_pattern = r"(https?://[^\s\"<>]+(?:findox\.com|mimecastprotect\.com)[^\s\"<>]*)?download=true"
-            # Note: We specifically look for the one with download=true if possible, or just the base link
+            # --- NEW REGEX LOGIC ---
+            # This looks for: href="THE_URL" ... > (Web)
+            # It explicitly anchors the search to the text "(Web)" shown in your screenshot
+            link_pattern = r"href=[\"']([^\"']+)[\"'][^>]*>\s*\(Web\)"
             
-            # Broader regex to catch the Mimecast wrapper that redirects to Findox
-            broad_pattern = r"(https?://[^\s\"<>]+(?:findox\.com|mimecastprotect\.com)[^\s\"<>]+)"
+            match = re.search(link_pattern, body_content, re.IGNORECASE)
             
             found_link = None
-            match = re.search(broad_pattern, body_content)
-            
             if match:
+                # Group 1 is the URL inside the quotes
                 found_link = match.group(1)
-                log_callback(f"\n[+] FOUND LINK: {found_link}")
+                # Decode HTML entities if present (e.g. &amp; -> &)
+                found_link = found_link.replace("&amp;", "&")
+                
+                log_callback(f"\n[+] FOUND DOCUMENT LINK: {found_link}")
                 log_callback("Auto-filling Browser Input...")
             else:
-                log_callback("\n[-] No specific FinDox link found in body.")
+                log_callback("\n[-] Could not find a link labeled '(Web)' in the email body.")
+                log_callback("Check if the email format matches the screenshot.")
+                # Fallback: Print all links found for debugging
+                all_links = re.findall(r"href=[\"']([^\"']+)[\"']", body_content)
+                if all_links:
+                    log_callback(f"Debug - First 3 links found: {all_links[:3]}")
                 
             log_callback("="*50)
             status_callback("SUCCESS - Email Read!")
             
-            # Pass the link back to the GUI to update the input field
+            # Pass the link back to the GUI
             code_callback(None, None, subject, found_link)
         else:
             log_callback("Mailbox empty.")
