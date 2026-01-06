@@ -170,43 +170,41 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
 # EMAIL LOGIC (SHARED MAILBOX)
 # =============================================================================
 def run_email_validation(password, log_callback, status_callback, code_callback):
+    import re
+
     import msal
     import requests
     
     status_callback("Connecting to Graph API...")
     log_callback("="*50)
-    log_callback(f"Admin User: {CONFIG['ADMIN_EMAIL']}")
     log_callback(f"Target Inbox: {CONFIG['TARGET_MAILBOX']}")
     log_callback("="*50)
     
+    # 1. Auth Flow (Same as before)
     app = msal.PublicClientApplication(
         client_id=CONFIG["MS_CLIENT_ID"],
         authority=f"https://login.microsoftonline.com/{CONFIG['MS_TENANT_ID']}"
     )
     
-    # We ask for Shared permissions
-    scopes = ["User.Read", "Mail.Read.Shared"]
-    
-    flow = app.initiate_device_flow(scopes=scopes)
+    flow = app.initiate_device_flow(scopes=["User.Read", "Mail.Read.Shared"])
     if "user_code" not in flow:
-        log_callback("Error initializing auth flow.")
+        log_callback(f"Auth Init Error: {flow.get('error_description')}")
         return
         
     code_callback(flow["user_code"], flow["verification_uri"])
-    log_callback(f"\nPLEASE AUTHENTICATE:\n1. Open {flow['verification_uri']}\n2. Enter: {flow['user_code']}\n3. Login as {CONFIG['ADMIN_EMAIL']}")
+    log_callback(f"\nACTION REQUIRED:\n1. Go to {flow['verification_uri']}\n2. Enter {flow['user_code']}")
     
     result = app.acquire_token_by_device_flow(flow)
-    
     if "access_token" not in result:
-        log_callback("Auth failed.")
-        status_callback("Failed")
+        status_callback("Auth Failed")
         return
         
-    log_callback("Auth Successful! Querying Shared Mailbox...")
+    log_callback("Auth Success! Fetching email body...")
     
-    # Query the Shared Mailbox directly
+    # 2. Query Message WITH Body Preview (to find the link)
     headers = {"Authorization": f"Bearer {result['access_token']}"}
-    endpoint = f"https://graph.microsoft.com/v1.0/users/{CONFIG['TARGET_MAILBOX']}/messages?$top=1&$select=subject,from"
+    # We ask for 'bodyPreview' and 'body' to hunt for the link
+    endpoint = f"https://graph.microsoft.com/v1.0/users/{CONFIG['TARGET_MAILBOX']}/messages?$top=1&$select=subject,from,body,bodyPreview"
     
     resp = requests.get(endpoint, headers=headers)
     
@@ -214,19 +212,43 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
         data = resp.json()
         if data.get("value"):
             email = data["value"][0]
+            subject = email.get('subject')
+            body_content = email.get('body', {}).get('content', '') + email.get('bodyPreview', '')
+            
             log_callback("\n" + "="*50)
-            log_callback("SUCCESS! Shared Mailbox Accessible.")
-            log_callback(f"Latest Subject: {email.get('subject')}")
+            log_callback("SUCCESS! Email Found.")
+            log_callback(f"Subject: {subject}")
+            
+            # --- LINK EXTRACTION LOGIC ---
+            # Looks for http links containing 'findox' or 'mimecast'
+            # Regex explanation: http(s):// (not space or quote)* (findox or mimecast) (not space or quote)*
+            link_pattern = r"(https?://[^\s\"<>]+(?:findox\.com|mimecastprotect\.com)[^\s\"<>]*)?download=true"
+            # Note: We specifically look for the one with download=true if possible, or just the base link
+            
+            # Broader regex to catch the Mimecast wrapper that redirects to Findox
+            broad_pattern = r"(https?://[^\s\"<>]+(?:findox\.com|mimecastprotect\.com)[^\s\"<>]+)"
+            
+            found_link = None
+            match = re.search(broad_pattern, body_content)
+            
+            if match:
+                found_link = match.group(1)
+                log_callback(f"\n[+] FOUND LINK: {found_link}")
+                log_callback("Auto-filling Browser Input...")
+            else:
+                log_callback("\n[-] No specific FinDox link found in body.")
+                
             log_callback("="*50)
-            status_callback("SUCCESS - Mailbox Validated!")
-            code_callback(None, None, email.get('subject'))
+            status_callback("SUCCESS - Email Read!")
+            
+            # Pass the link back to the GUI to update the input field
+            code_callback(None, None, subject, found_link)
         else:
-            log_callback("Access OK, but mailbox is empty.")
-            status_callback("SUCCESS (Empty Inbox)")
+            log_callback("Mailbox empty.")
+            status_callback("Empty Inbox")
     else:
-        log_callback(f"API Error: {resp.status_code}\n{resp.text}")
-        status_callback("Failed - API Error")
-
+        log_callback(f"API Error: {resp.text}")
+        status_callback("API Error")
 # =============================================================================
 # GUI SETUP
 # =============================================================================
@@ -289,11 +311,17 @@ class App:
     def _status_upd(self, msg):
         self.root.after(0, lambda: self.status.set(msg))
 
-    def _code_upd(self, code, url, subject=None):
+    def _code_upd(self, code, url, subject=None, extracted_link=None):
         def _do():
-            if subject: self.code_lbl.config(text=f"Last Email: {subject}", foreground="green")
-            elif code: self.code_lbl.config(text=f"CODE: {code}  (Enter at {url})", foreground="red")
-            else: self.code_lbl.config(text="")
+            if subject: 
+                self.code_lbl.config(text=f"Last Email: {subject}", foreground="green")
+                # AUTO-FILL THE INPUT FIELD
+                if extracted_link:
+                    self.url_var.set(extracted_link)
+            elif code: 
+                self.code_lbl.config(text=f"CODE: {code}  (Enter at {url})", foreground="red")
+            else: 
+                self.code_lbl.config(text="")
         self.root.after(0, _do)
 
     def _enable_save(self, enable, ctx=None, f=None, l=None):
