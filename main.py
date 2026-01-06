@@ -199,7 +199,7 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
         status_callback("Auth Failed")
         return
         
-    log_callback("Auth Success! Fetching email body...")
+    log_callback("Auth Success! Scanning email...")
     
     # 2. Query Message
     headers = {"Authorization": f"Bearer {result['access_token']}"}
@@ -212,42 +212,55 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
         if data.get("value"):
             email = data["value"][0]
             subject = email.get('subject')
-            # Get the full HTML content of the email
             body_content = email.get('body', {}).get('content', '')
             
             log_callback("\n" + "="*50)
-            log_callback("SUCCESS! Email Found.")
             log_callback(f"Subject: {subject}")
             
-            # --- NEW REGEX LOGIC ---
-            # This looks for: href="THE_URL" ... > (Web)
-            # It explicitly anchors the search to the text "(Web)" shown in your screenshot
-            link_pattern = r"href=[\"']([^\"']+)[\"'][^>]*>\s*\(Web\)"
-            
-            match = re.search(link_pattern, body_content, re.IGNORECASE)
-            
             found_link = None
-            if match:
-                # Group 1 is the URL inside the quotes
-                found_link = match.group(1)
-                # Decode HTML entities if present (e.g. &amp; -> &)
-                found_link = found_link.replace("&amp;", "&")
-                
-                log_callback(f"\n[+] FOUND DOCUMENT LINK: {found_link}")
-                log_callback("Auto-filling Browser Input...")
+
+            # --- STRATEGY 1: The 'Golden Key' (download=true) ---
+            # This is the most robust method based on your latest data.
+            # It ignores the 'Deal' link because that doesn't have download=true.
+            
+            # Regex: href=" (any url containing findox.com AND download=true) "
+            match_perfect = re.search(r'href=[\"\'](https?://[^\"\']*findox\.com[^\"\']*download=true[^\"\']*)[\"\']', body_content, re.IGNORECASE)
+            
+            if match_perfect:
+                found_link = match_perfect.group(1)
+                log_callback("\n[+] MATCH: Found exact 'findox...download=true' link.")
+            
             else:
-                log_callback("\n[-] Could not find a link labeled '(Web)' in the email body.")
-                log_callback("Check if the email format matches the screenshot.")
-                # Fallback: Print all links found for debugging
-                all_links = re.findall(r"href=[\"']([^\"']+)[\"']", body_content)
-                if all_links:
-                    log_callback(f"Debug - First 3 links found: {all_links[:3]}")
+                # --- STRATEGY 2: Mimecast Rewritten URLs ---
+                # Sometimes security software hides the parameters.
+                match_mime = re.search(r'href=[\"\'](https?://[^\"\']*mimecastprotect\.com[^\"\']*)[\"\']', body_content, re.IGNORECASE)
+                if match_mime:
+                    found_link = match_mime.group(1)
+                    log_callback("\n[+] MATCH: Found Mimecast Redirect.")
                 
+                else:
+                    # --- STRATEGY 3: Fallback to Proximity (Web) ---
+                    match_prox = re.search(r"href=[\"']([^\"']+)[\"'].{1,300}?\(Web\)", body_content, re.IGNORECASE | re.DOTALL)
+                    if match_prox:
+                        found_link = match_prox.group(1)
+                        log_callback("\n[+] MATCH: Found link next to '(Web)' label.")
+
+            if found_link:
+                # Sanitize HTML entities (e.g. &amp; -> &)
+                found_link = found_link.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                
+                log_callback(f"Extracted URL: {found_link}")
+                log_callback("Auto-filling Browser Input...")
+                code_callback(None, None, subject, found_link)
+            else:
+                log_callback("\n[!] NO DOWNLOAD LINK FOUND.")
+                log_callback("Debug Dump (All hrefs):")
+                all_links = re.findall(r'href=[\"\']([^\"\']+)[\"\']', body_content)
+                for i, link in enumerate(all_links):
+                    log_callback(f" #{i+1}: {link[:100]}...") # Print first 100 chars
+
             log_callback("="*50)
             status_callback("SUCCESS - Email Read!")
-            
-            # Pass the link back to the GUI
-            code_callback(None, None, subject, found_link)
         else:
             log_callback("Mailbox empty.")
             status_callback("Empty Inbox")
