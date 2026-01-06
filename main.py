@@ -54,7 +54,12 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
     
     # Path setup
     try:
-        base_path = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path.cwd()
+        # base_path = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path.cwd()
+        if getattr(sys, 'frozen', False):
+            base_path = Path(sys.executable).parent
+        else:
+            base_path = Path.cwd()
+
         download_dir = (base_path / CONFIG["DOWNLOAD_DIR"]).absolute()
         download_dir.mkdir(parents=True, exist_ok=True)
         state_file = (base_path / CONFIG["STATE_FILE"]).absolute()
