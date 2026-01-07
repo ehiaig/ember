@@ -1,5 +1,5 @@
 """
-Ember Validation Spike - Final Release
+EvergreenPipeline Validation Spike
 =======================================
 A standalone tool to validate:
 1. Browser Automation (Bypassing Intune/SSO & capturing Mimecast downloads)
@@ -28,8 +28,8 @@ CONFIG = {
     "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
 
     # --- EMAIL SETTINGS ---
-    "ADMIN_EMAIL": "dev-admin@emberapp.io", 
-    "TARGET_MAILBOX": "samco@emberapp.io", 
+    "ADMIN_EMAIL": "dev-admin@emberapp.io",
+    "TARGET_MAILBOX": "samco@emberapp.io",
 
     # Microsoft Graph (Azure CLI Public Client - Safe for Enterprise)
     "MS_CLIENT_ID": "268bea51-ff50-4d3d-b09d-396cfad6764d",
@@ -37,7 +37,7 @@ CONFIG = {
 }
 
 # =============================================================================
-# BROWSER LOGIC
+# BROWSER LOGIC (UPDATED: Persistent Profile)
 # =============================================================================
 def run_browser_validation(test_url, log_callback, status_callback, save_session_callback):
     try:
@@ -49,12 +49,13 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
     status_callback("Initializing Browser...")
     log_callback("="*50)
     log_callback("BROWSER VALIDATION STARTED")
+    log_callback("Mode: Persistent Profile (Intune Compliance)")
     log_callback(f"Target URL: {test_url}")
     log_callback("="*50)
     
     # Path setup
     try:
-        # base_path = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path.cwd()
+        # Determine paths
         if getattr(sys, 'frozen', False):
             base_path = Path(sys.executable).parent
         else:
@@ -62,41 +63,50 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
 
         download_dir = (base_path / CONFIG["DOWNLOAD_DIR"]).absolute()
         download_dir.mkdir(parents=True, exist_ok=True)
-        state_file = (base_path / CONFIG["STATE_FILE"]).absolute()
+        
+        # NEW: Persistent Profile Directory
+        # This folder will store the "Signed In" state of the browser itself
+        profile_dir = (base_path / "edge_profile").absolute()
+        log_callback(f"Profile Path: {profile_dir}")
+        
     except Exception as e:
         log_callback(f"Path Error: {e}")
         return
 
-    has_session = state_file.exists()
-    
     with sync_playwright() as p:
-        # Launch real Edge (if available) to match Intune policies
-        try:
-            browser = p.chromium.launch(headless=False, channel="msedge" if os.name == 'nt' else "chrome")
-        except:
-            browser = p.chromium.launch(headless=False) # Fallback
+        # LAUNCH ARGS: Make it look like a real user's browser, not a bot
+        # This helps bypass "AutomationControlled" flags that trigger stricter policies
+        launch_args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-service-autorun",
+            "--password-store=basic",
+        ]
 
-        context_opts = {
-            "user_agent": CONFIG["USER_AGENT"],
-            "viewport": {"width": 1280, "height": 800},
-            "accept_downloads": True
-        }
+        log_callback("Launching Edge with Persistent Profile...")
         
-        # Load Session if exists
-        if has_session:
-            try:
-                context = browser.new_context(storage_state=str(state_file), **context_opts)
-                log_callback("Loaded existing session state.")
-            except:
-                log_callback("Session invalid. Creating new context.")
-                context = browser.new_context(**context_opts)
-                has_session = False
-        else:
-            context = browser.new_context(**context_opts)
-            
-        page = context.new_page()
+        try:
+            # SWITCH TO: launch_persistent_context
+            # This is the key fix. It creates a permanent user data folder.
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                channel="msedge" if os.name == 'nt' else "chrome",
+                headless=False,
+                args=launch_args,
+                viewport={"width": 1280, "height": 800},
+                accept_downloads=True,
+                # Try to ignore the 'Chrome is being controlled by automation' banner
+                ignore_default_args=["--enable-automation"] 
+            )
+        except Exception as e:
+            log_callback(f"Launch Failed: {e}")
+            log_callback("Try closing all other Edge windows and running again.")
+            return
+
+        # Persistent contexts open a page by default
+        page = context.pages[0] if context.pages else context.new_page()
         
-        # Download Listener
+        # Setup Download Listener
         download_status = {"success": False, "path": None}
         def on_download(download):
             try:
@@ -111,42 +121,28 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
 
         page.on("download", on_download)
         
-        # --- LOGIN PHASE ---
-        if not has_session:
-            log_callback(f"Navigating to Login: {CONFIG['LOGIN_URL']}")
-            page.goto(CONFIG['LOGIN_URL'])
-            
-            log_callback("\n" + "="*40)
-            log_callback("ACTION REQUIRED: PLEASE LOGIN")
-            log_callback("Complete the SSO/MFA flow manually in the browser.")
-            log_callback("When you reach the Dashboard, click 'Save Session'.")
-            log_callback("="*40 + "\n")
-            
-            # Enable Save Button and Wait
-            save_session_callback(True, context, state_file, log_callback)
-            
-            # Keep browser alive until user acts
-            while context.pages:
-                page.wait_for_timeout(1000)
-            return
-
-        # --- DOWNLOAD PHASE ---
-        log_callback("\nTesting Download via Link...")
-        log_callback("Note: Mimecast/Redirect links are supported.")
+        # --- NAVIGATION ---
+        log_callback(f"\nNavigating to: {test_url}")
+        log_callback("NOTE: If you see 'Sign in to Edge', please do so.")
+        log_callback("We need the browser to be 'Managed' to download the file.")
         
         try:
-            # Navigate to the pasted URL (Mimecast or Direct)
-            # If it's a download link, Playwright catches the event, page might not 'load' fully
-            page.goto(test_url, wait_until="domcontentloaded", timeout=45000)
+            page.goto(test_url, wait_until="domcontentloaded", timeout=60000)
         except Exception as e:
-            # It's common for download links to 'fail' navigation because they don't render HTML
-            log_callback(f"Navigation ended (Expected for direct downloads): {e}")
+            log_callback(f"Navigation note: {e}")
 
-        # Wait for download to finish
-        log_callback("Waiting for file stream...")
-        for _ in range(15): # Wait up to 15 seconds
+        # --- WAIT LOOP ---
+        # We wait longer now to allow him to handle the "Switch Profile" or Login prompts
+        log_callback("\nWaiting for download...")
+        log_callback("If stuck on login screens, please complete them manually.")
+        
+        # Wait up to 3 minutes for user to fight through the login screens
+        for i in range(180): 
             if download_status["success"]:
                 break
+            if i % 10 == 0:
+                # Keep session alive
+                page.wait_for_timeout(100)
             page.wait_for_timeout(1000)
             
         if download_status["success"]:
@@ -154,18 +150,17 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
             log_callback("\n" + "="*50)
             log_callback("MILESTONE PASS: File retrieved via Managed Browser.")
             log_callback("="*50)
+            messagebox.showinfo("Success", "File Downloaded Successfully!")
         else:
             status_callback("Inconclusive - No file yet")
-            log_callback("\nDownload didn't trigger automatically.")
-            log_callback("Try clicking the download button manually in the open browser.")
-            
-            # Keep open for manual test
-            page.wait_for_timeout(30000)
+            log_callback("\nTimed out waiting for download.")
+            log_callback("Browser will remain open for manual testing...")
+            page.wait_for_timeout(30000) # Keep open for 30s more
 
-        log_callback("Closing Browser...")
-        context.close()
-        browser.close()
-
+        try:
+            context.close()
+        except:
+            pass
 # =============================================================================
 # UPDATED EMAIL LOGIC (Targeting "(Web)" links specifically)
 # =============================================================================
@@ -267,13 +262,14 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
     else:
         log_callback(f"API Error: {resp.text}")
         status_callback("API Error")
+
 # =============================================================================
 # GUI SETUP
 # =============================================================================
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Ember Validation Spike (Final)")
+        self.root.title("Evergreen Pipeline")
         self.root.geometry("750x650")
         
         self.browser_ctx = None

@@ -258,3 +258,7 @@ pyinstaller --onefile --windowed --name "ValidationSpike" ^
 2. **No secrets in code**: Device Code Flow doesn't require client secrets
 3. **Token storage**: MSAL tokens are stored in memory only (not persisted)
 4. **Download folder**: Created in same directory as exe - ensure write permissions
+
+
+Notes:
+- Had 
