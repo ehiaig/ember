@@ -33,7 +33,7 @@ CONFIG = {
     # Microsoft Graph (Azure CLI Public Client - Safe for Enterprise)
     "MS_CLIENT_ID": "268bea51-ff50-4d3d-b09d-396cfad6764d",
     "MS_TENANT_ID": "bd18e10f-0f57-4b5e-813d-98086df34ca1",
-    "MS_CLIENT_SECRET_VALUE": "fsx8Q~xDITdunUosqUl2dwc5kPxreFkPN.9e5bA5"
+    "MS_CLIENT_SECRET_VALUE": ""
 }
 
 # =============================================================================
