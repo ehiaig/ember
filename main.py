@@ -31,7 +31,7 @@ CONFIG = {
 }
 
 # =============================================================================
-# BROWSER LOGIC (FIXED: Human-Like Typing for SSO Trigger)
+# BROWSER LOGIC (FIXED: True "Human Typing" Simulation)
 # =============================================================================
 def run_browser_validation(test_url, log_callback, status_callback, save_session_callback):
     try:
@@ -44,7 +44,7 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
     log_callback("="*50)
     log_callback("BROWSER VALIDATION STARTED")
     
-    # --- PATH SETUP (Stable AppData) ---
+    # --- PATH SETUP ---
     try:
         if getattr(sys, 'frozen', False):
             base_path = Path(sys.executable).parent
@@ -109,26 +109,14 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         except:
             pass 
 
-        # --- SMART LOOP: Auto-Fill & Retry ---
+        # --- SMART LOOP: True Typing Mode ---
         log_callback("\nScanning for Login Fields...")
         
-        # Helper to find username/email field
         def find_login_field(pg):
-            selectors = [
-                "input[name='username']",     
-                "input[id='username']",       
-                "input[type='email']", 
-                "input[name='email']", 
-                "input[placeholder*='User']",
-                "input[placeholder*='Email address*']"
-            ]
-            
-            # Check Main Page
+            selectors = ["input[name='username']", "input[id='username']", "input[type='email']", "input[name='email']"]
             for s in selectors:
                 el = pg.query_selector(s)
                 if el and el.is_visible(): return el
-            
-            # Check iFrames
             for frame in pg.frames:
                 for s in selectors:
                     try:
@@ -137,8 +125,8 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
                     except: pass
             return None
 
-        download_retried = False
         email_filled = False
+        download_retried = False
 
         for i in range(120): # Loop for 2 minutes
             if download_status["success"]:
@@ -148,44 +136,39 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
             if not email_filled:
                 try:
                     target_input = find_login_field(page)
-                    
-                    if target_input:
-                        # Only fill if empty
-                        if not target_input.input_value():
-                            log_callback(f"Found Field '{target_input.get_attribute('name')}'. Auto-filling...")
-                            
-                            # CLICK to focus (wakes up the JS)
-                            target_input.click()
-                            
-                            # TYPE SLOWLY (100ms delay per key) to trigger SSO detection
-                            log_callback(f"Typing email with human delay...")
-                            target_input.type(CONFIG["CLIENT_EMAIL"], delay=100)
-                            
-                            # CRITICAL: Wait for SSO scripts to run after typing
-                            page.wait_for_timeout(2000)
-                            
-                            email_filled = True
-                            
-                            # Click Continue/Next/Login
-                            btn_selectors = [
-                                "button:has-text('Continue')", 
-                                "button:has-text('Next')", 
-                                "button:has-text('Log in')",
-                                "button:has-text('Sign in')",
-                                "button[type='submit']"
-                            ]
-                            for sel in btn_selectors:
-                                btn = page.query_selector(sel)
-                                if btn and btn.is_visible():
-                                    log_callback("Clicking Submit button...")
-                                    btn.click()
-                                    break
+                    if target_input and not target_input.input_value():
+                        log_callback(f"Found Field. Typing email character-by-character...")
+                        
+                        target_input.click()
+                        
+                        # FIX: Use press_sequentially instead of fill
+                        # This fires keydown/keyup for EVERY letter
+                        target_input.press_sequentially(CONFIG["CLIENT_EMAIL"], delay=100)
+                        
+                        # Explicitly blur (unfocus) to trigger validation events
+                        target_input.blur()
+                        page.wait_for_timeout(2000) # Wait for JS validation
+                        
+                        # Try hitting Enter first (often triggers scripts better than clicking)
+                        log_callback("Sending ENTER key...")
+                        target_input.press("Enter")
+                        
+                        # Fallback: If Enter didn't work, try clicking button after a delay
+                        page.wait_for_timeout(2000)
+                        btn = page.query_selector("button:has-text('Continue'), button:has-text('Next'), button[type='submit']")
+                        if btn and btn.is_visible():
+                             # Only click if we are still on the login URL
+                             if "login" in page.url.lower():
+                                 log_callback("Clicking Continue...")
+                                 btn.click()
+
+                        email_filled = True
                 except Exception as e:
                     pass 
 
-            # 2. SMART RETRY LOGIC
-            # If we are NOT on a login page, but download hasn't started, force the link again.
-            if not download_status["success"] and not download_retried and i > 8:
+            # 2. SMART RETRY LOGIC (Kept intact)
+            if not download_status["success"] and not download_retried and i > 25:
+                # Wait longer (25s) to allow for the slow typing
                 url_str = page.url.lower()
                 is_login_page = "login" in url_str or "signin" in url_str or "auth" in url_str
                 
