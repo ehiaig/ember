@@ -120,7 +120,7 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
                 "input[type='email']", 
                 "input[name='email']", 
                 "input[placeholder*='User']",
-                "input[placeholder*='Email']"
+                "input[placeholder*='Email address*']"
             ]
             
             # Check Main Page
