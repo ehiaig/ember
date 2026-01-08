@@ -31,7 +31,7 @@ CONFIG = {
 }
 
 # =============================================================================
-# BROWSER LOGIC (FIXED: "Username" Support + Stable Profile)
+# BROWSER LOGIC (FIXED: Human-Like Typing for SSO Trigger)
 # =============================================================================
 def run_browser_validation(test_url, log_callback, status_callback, save_session_callback):
     try:
@@ -53,7 +53,6 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         download_dir = (base_path / CONFIG["DOWNLOAD_DIR"]).absolute()
         download_dir.mkdir(parents=True, exist_ok=True)
 
-        # Uses AppData so the profile persists even if you move the EXE
         app_data = Path(os.getenv('LOCALAPPDATA')) / "EvergreenPipeline"
         profile_dir = (app_data / "edge_profile").absolute()
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -115,14 +114,13 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         
         # Helper to find username/email field
         def find_login_field(pg):
-            # UPDATED SELECTORS based on your feedback
             selectors = [
-                "input[name='username']",     # <--- Priority #1
-                "input[id='username']",       # <--- Priority #2
+                "input[name='username']",     
+                "input[id='username']",       
                 "input[type='email']", 
                 "input[name='email']", 
                 "input[placeholder*='User']",
-                "input[placeholder*='Email address*']"
+                "input[placeholder*='Email']"
             ]
             
             # Check Main Page
@@ -155,11 +153,18 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
                         # Only fill if empty
                         if not target_input.input_value():
                             log_callback(f"Found Field '{target_input.get_attribute('name')}'. Auto-filling...")
-                            target_input.click()
-                            target_input.fill(CONFIG["CLIENT_EMAIL"])
-                            email_filled = True
                             
-                            page.wait_for_timeout(500)
+                            # CLICK to focus (wakes up the JS)
+                            target_input.click()
+                            
+                            # TYPE SLOWLY (100ms delay per key) to trigger SSO detection
+                            log_callback(f"Typing email with human delay...")
+                            target_input.type(CONFIG["CLIENT_EMAIL"], delay=100)
+                            
+                            # CRITICAL: Wait for SSO scripts to run after typing
+                            page.wait_for_timeout(2000)
+                            
+                            email_filled = True
                             
                             # Click Continue/Next/Login
                             btn_selectors = [
@@ -206,7 +211,6 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
             context.close()
         except:
             pass
-
 # =============================================================================
 # EMAIL LOGIC (SHARED MAILBOX - APP ONLY)
 # =============================================================================
