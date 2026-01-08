@@ -31,7 +31,7 @@ CONFIG = {
 }
 
 # =============================================================================
-# BROWSER LOGIC (FIXED: Stable Profile + Auto-Fill)
+# BROWSER LOGIC (FIXED: "Username" Support + Stable Profile)
 # =============================================================================
 def run_browser_validation(test_url, log_callback, status_callback, save_session_callback):
     try:
@@ -44,9 +44,8 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
     log_callback("="*50)
     log_callback("BROWSER VALIDATION STARTED")
     
-    # --- PATH FIX: Use AppData for stability ---
+    # --- PATH SETUP (Stable AppData) ---
     try:
-        # 1. Download Path (Local to EXE)
         if getattr(sys, 'frozen', False):
             base_path = Path(sys.executable).parent
         else:
@@ -54,14 +53,11 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         download_dir = (base_path / CONFIG["DOWNLOAD_DIR"]).absolute()
         download_dir.mkdir(parents=True, exist_ok=True)
 
-        # 2. Profile Path (Stable AppData Location)
-        # This ensures cookies persist even if you move the EXE or download a new version
+        # Uses AppData so the profile persists even if you move the EXE
         app_data = Path(os.getenv('LOCALAPPDATA')) / "EvergreenPipeline"
         profile_dir = (app_data / "edge_profile").absolute()
         profile_dir.mkdir(parents=True, exist_ok=True)
-        
-        log_callback(f"Stable Profile Path: {profile_dir}")
-        log_callback("(This profile persists across app updates)")
+        log_callback(f"Profile: {profile_dir}")
         
     except Exception as e:
         log_callback(f"Path Error: {e}")
@@ -76,7 +72,6 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         ]
 
         log_callback("Launching Edge...")
-        
         try:
             context = p.chromium.launch_persistent_context(
                 user_data_dir=str(profile_dir),
@@ -89,12 +84,11 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
             )
         except Exception as e:
             log_callback(f"Launch Failed: {e}")
-            log_callback("CRITICAL: Close all existing Edge windows and try again.")
             return
 
         page = context.pages[0] if context.pages else context.new_page()
         
-        # --- DOWNLOAD LISTENER ---
+        # Download Listener
         download_status = {"success": False, "path": None}
         def on_download(download):
             try:
@@ -109,70 +103,104 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
 
         page.on("download", on_download)
         
-        # --- NAVIGATION ---
+        # Navigate
         log_callback(f"\nNavigating to: {test_url}")
         try:
             page.goto(test_url, wait_until="domcontentloaded", timeout=60000)
         except:
-            pass # Ignore timeouts, we handle logic in the loop
+            pass 
 
-        # --- SMART LOOP: Auto-Fill & Retry Logic ---
-        log_callback("\nProcessing Page...")
+        # --- SMART LOOP: Auto-Fill & Retry ---
+        log_callback("\nScanning for Login Fields...")
         
-        # We assume if we are on these URLs, we are NOT logged in yet
-        login_keywords = ["login", "signin", "auth"]
-        
-        # Flag to track if we tried re-triggering the download
+        # Helper to find username/email field
+        def find_login_field(pg):
+            # UPDATED SELECTORS based on your feedback
+            selectors = [
+                "input[name='username']",     # <--- Priority #1
+                "input[id='username']",       # <--- Priority #2
+                "input[type='email']", 
+                "input[name='email']", 
+                "input[placeholder*='User']",
+                "input[placeholder*='Email address*']"
+            ]
+            
+            # Check Main Page
+            for s in selectors:
+                el = pg.query_selector(s)
+                if el and el.is_visible(): return el
+            
+            # Check iFrames
+            for frame in pg.frames:
+                for s in selectors:
+                    try:
+                        el = frame.query_selector(s)
+                        if el and el.is_visible(): return el
+                    except: pass
+            return None
+
         download_retried = False
+        email_filled = False
 
-        for i in range(120): # Wait up to 2 minutes
+        for i in range(120): # Loop for 2 minutes
             if download_status["success"]:
                 break
             
-            current_url = page.url.lower()
-            
-            # 1. AUTO-FILL EMAIL (If input detected)
-            try:
-                # Look for typical email fields if we haven't filled them yet
-                email_field = page.query_selector("input[type='email'], input[name='email'], input[id*='email']")
-                if email_field and email_field.is_visible() and not email_field.input_value():
-                    log_callback(f"Auto-filling email: {CONFIG['CLIENT_EMAIL']}")
-                    email_field.fill(CONFIG["CLIENT_EMAIL"])
-                    page.wait_for_timeout(500)
-                    
-                    # Try to click Continue/Next
-                    btn = page.query_selector("button:has-text('Continue'), button:has-text('Next'), button[type='submit']")
-                    if btn:
-                        log_callback("Clicking Continue...")
-                        btn.click()
-            except:
-                pass # Ignore errors here, just keep checking
-
-            # 2. SMART RETRY (Issue #2 Fix)
-            # If we are NOT on a login page, but download hasn't started, force the link again.
-            is_login_page = any(k in current_url for k in login_keywords)
-            
-            if not is_login_page and not download_status["success"] and not download_retried and i > 5:
-                # We waited 5 ticks, we are not on login page, implies we are logged in.
-                log_callback("\n[!] Login appears complete, but no download yet.")
-                log_callback("[!] Re-triggering download link automatically...")
+            # 1. AUTO-FILL LOGIC
+            if not email_filled:
                 try:
-                    page.goto(test_url)
-                    download_retried = True
-                except:
-                    pass
+                    target_input = find_login_field(page)
+                    
+                    if target_input:
+                        # Only fill if empty
+                        if not target_input.input_value():
+                            log_callback(f"Found Field '{target_input.get_attribute('name')}'. Auto-filling...")
+                            target_input.click()
+                            target_input.fill(CONFIG["CLIENT_EMAIL"])
+                            email_filled = True
+                            
+                            page.wait_for_timeout(500)
+                            
+                            # Click Continue/Next/Login
+                            btn_selectors = [
+                                "button:has-text('Continue')", 
+                                "button:has-text('Next')", 
+                                "button:has-text('Log in')",
+                                "button:has-text('Sign in')",
+                                "button[type='submit']"
+                            ]
+                            for sel in btn_selectors:
+                                btn = page.query_selector(sel)
+                                if btn and btn.is_visible():
+                                    log_callback("Clicking Submit button...")
+                                    btn.click()
+                                    break
+                except Exception as e:
+                    pass 
+
+            # 2. SMART RETRY LOGIC
+            # If we are NOT on a login page, but download hasn't started, force the link again.
+            if not download_status["success"] and not download_retried and i > 8:
+                url_str = page.url.lower()
+                is_login_page = "login" in url_str or "signin" in url_str or "auth" in url_str
+                
+                if not is_login_page:
+                    log_callback("[!] Login appears done. Re-triggering download link...")
+                    try:
+                        page.goto(test_url)
+                        download_retried = True
+                    except: pass
 
             page.wait_for_timeout(1000)
             
         if download_status["success"]:
             status_callback("SUCCESS - File Downloaded!")
             log_callback("\n" + "="*50)
-            log_callback("MILESTONE PASS: File retrieved via Managed Browser.")
+            log_callback("MILESTONE PASS: File retrieved.")
             log_callback("="*50)
             messagebox.showinfo("Success", "File Downloaded Successfully!")
         else:
             status_callback("Inconclusive")
-            log_callback("\nTimed out. Please check if file downloaded manually.")
 
         try:
             context.close()
@@ -333,7 +361,6 @@ class App:
             return
         
         self.btn_browser.config(state=tk.DISABLED)
-        # Pass None for save_callback as we removed the manual save button (auto-save is better)
         threading.Thread(target=run_browser_validation, args=(url, self._log, self._status_upd, None), daemon=True).start()
         self.root.after(3000, lambda: self.btn_browser.config(state=tk.NORMAL))
 
