@@ -28,12 +28,12 @@ CONFIG = {
     "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
 
     # --- EMAIL SETTINGS ---
-    "ADMIN_EMAIL": "dev-admin@emberapp.io",
     "TARGET_MAILBOX": "samco@emberapp.io",
 
     # Microsoft Graph (Azure CLI Public Client - Safe for Enterprise)
     "MS_CLIENT_ID": "268bea51-ff50-4d3d-b09d-396cfad6764d",
     "MS_TENANT_ID": "bd18e10f-0f57-4b5e-813d-98086df34ca1",
+    "MS_CLIENT_SECRET_VALUE": "fsx8Q~xDITdunUosqUl2dwc5kPxreFkPN.9e5bA5"
 }
 
 # =============================================================================
@@ -170,127 +170,95 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
     import msal
     import requests
 
-    # --- PATH SETUP ---
-    # We save the token next to the EXE so it persists across runs
-    if getattr(sys, 'frozen', False):
-        base_path = Path(sys.executable).parent
-    else:
-        base_path = Path.cwd()
-        
-    cache_path = base_path / "email_token.bin"
-    
-    status_callback("Connecting to Graph API...")
+    status_callback("Authenticating (App-Only)...")
     log_callback("="*50)
     log_callback(f"Target Inbox: {CONFIG['TARGET_MAILBOX']}")
     log_callback("="*50)
 
-    # 1. Setup Token Cache (The "Memory")
-    cache = msal.SerializableTokenCache()
-    if cache_path.exists():
-        try:
-            cache.deserialize(open(cache_path, "r").read())
-            log_callback("Found cached credentials.")
-        except:
-            log_callback("Cache unreadable, starting fresh.")
-
-    # 2. Setup App with Cache
-    app = msal.PublicClientApplication(
-        client_id=CONFIG["MS_CLIENT_ID"],
+    # 1. Setup Confidential Client (Service Principal)
+    # We use ConfidentialClientApplication instead of PublicClientApplication
+    app = msal.ConfidentialClientApplication(
+        CONFIG["MS_CLIENT_ID"],
         authority=f"https://login.microsoftonline.com/{CONFIG['MS_TENANT_ID']}",
-        token_cache=cache
+        client_credential=CONFIG["MS_CLIENT_SECRET_VALUE"]
     )
-    
-    scopes = ["User.Read", "Mail.Read.Shared"]
-    result = None
-    
-    # 3. Try SILENT Authentication first (The "Easy" Way)
-    accounts = app.get_accounts()
-    if accounts:
-        log_callback(f"Attempting silent login for {accounts[0]['username']}...")
-        result = app.acquire_token_silent(scopes, account=accounts[0])
-    
-    # 4. If Silent Fails, do Interactive (The "Hard" Way)
-    if not result:
-        log_callback("Silent login failed/expired. Interactive login required.")
-        flow = app.initiate_device_flow(scopes=scopes)
-        if "user_code" not in flow:
-            log_callback(f"Auth Init Error: {flow.get('error_description')}")
-            return
-            
-        code_callback(flow["user_code"], flow["verification_uri"])
-        log_callback(f"\nACTION REQUIRED:\n1. Go to {flow['verification_uri']}\n2. Enter {flow['user_code']}")
-        
-        result = app.acquire_token_by_device_flow(flow)
-        
-    # 5. Process Result
+
+    # 2. Acquire Token
+    # The scope is always '.default' for App-Only flows. 
+    # This tells Azure: "Give me all permissions (Mail.Read) defined in the portal."
+    result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+
     if "access_token" in result:
-        # SAVE THE CACHE (So next time is silent)
-        if cache.has_state_changed:
-            with open(cache_path, "w") as f:
-                f.write(cache.serialize())
-            log_callback("Session saved to disk (Next run will be silent).")
-            
-        log_callback("Auth Success! Scanning email...")
-        # ... (Proceed with the exact same mailbox scanning logic as before) ...
+        log_callback("Auth Success! Accessing mailbox as Service...")
         
-        # --- (Paste the REST of the mailbox scanning logic here from previous step) ---
-        # 1. Query Message
+        # 3. Query Message
         headers = {"Authorization": f"Bearer {result['access_token']}"}
+        # Note: We query /users/{target}/messages directly
         endpoint = f"https://graph.microsoft.com/v1.0/users/{CONFIG['TARGET_MAILBOX']}/messages?$top=1&$select=subject,from,body"
         
-        resp = requests.get(endpoint, headers=headers)
-        # ... (Keep the exact logic we perfected in the last turn) ...
-        # (For brevity, I assume you will copy the REGEX logic from the previous "Final Logic" response here)
-        
-        # --- SHORT VERSION OF SCANNING LOGIC FOR COPY-PASTE ---
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("value"):
-                email = data["value"][0]
-                subject = email.get('subject')
-                body_content = email.get('body', {}).get('content', '')
-                
-                log_callback("\n" + "="*50)
-                log_callback(f"Subject: {subject}")
-                
-                # RE-USE THE ROBUST REGEX FROM PREVIOUS TURN
-                match_perfect = re.search(r'href=[\"\'](https?://[^\"\']*findox\.com[^\"\']*download=true[^\"\']*)[\"\']', body_content, re.IGNORECASE)
-                
-                found_link = None
-                if match_perfect:
-                    found_link = match_perfect.group(1)
-                    log_callback("\n[+] MATCH: Found exact 'findox...download=true' link.")
-                else:
-                    match_mime = re.search(r'href=[\"\'](https?://[^\"\']*mimecastprotect\.com[^\"\']*)[\"\']', body_content, re.IGNORECASE)
-                    if match_mime:
-                        found_link = match_mime.group(1)
-                        log_callback("\n[+] MATCH: Found Mimecast Redirect.")
-                    else:
-                        match_prox = re.search(r"href=[\"']([^\"']+)[\"'].{1,300}?\(Web\)", body_content, re.IGNORECASE | re.DOTALL)
-                        if match_prox:
-                            found_link = match_prox.group(1)
-                            log_callback("\n[+] MATCH: Found link next to '(Web)' label.")
-
-                if found_link:
-                    found_link = found_link.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-                    log_callback(f"Extracted URL: {found_link}")
-                    log_callback("Auto-filling Browser Input...")
-                    code_callback(None, None, subject, found_link)
-                else:
-                    log_callback("\n[!] NO DOWNLOAD LINK FOUND.")
+        try:
+            resp = requests.get(endpoint, headers=headers)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("value"):
+                    email = data["value"][0]
+                    subject = email.get('subject')
+                    body_content = email.get('body', {}).get('content', '')
                     
-                log_callback("="*50)
-                status_callback("SUCCESS - Email Read!")
+                    log_callback("\n" + "="*50)
+                    log_callback(f"Subject: {subject}")
+                    
+                    # --- REGEX LOGIC (Preserved from your original code) ---
+                    match_perfect = re.search(r'href=[\"\'](https?://[^\"\']*findox\.com[^\"\']*download=true[^\"\']*)[\"\']', body_content, re.IGNORECASE)
+                    
+                    found_link = None
+                    if match_perfect:
+                        found_link = match_perfect.group(1)
+                        log_callback("\n[+] MATCH: Found exact 'findox...download=true' link.")
+                    else:
+                        match_mime = re.search(r'href=[\"\'](https?://[^\"\']*mimecastprotect\.com[^\"\']*)[\"\']', body_content, re.IGNORECASE)
+                        if match_mime:
+                            found_link = match_mime.group(1)
+                            log_callback("\n[+] MATCH: Found Mimecast Redirect.")
+                        else:
+                            match_prox = re.search(r"href=[\"']([^\"']+)[\"'].{1,300}?\(Web\)", body_content, re.IGNORECASE | re.DOTALL)
+                            if match_prox:
+                                found_link = match_prox.group(1)
+                                log_callback("\n[+] MATCH: Found link next to '(Web)' label.")
+
+                    if found_link:
+                        # Clean HTML entities
+                        found_link = found_link.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                        log_callback(f"Extracted URL: {found_link}")
+                        log_callback("Auto-filling Browser Input...")
+                        # Pass to GUI
+                        code_callback(None, None, subject, found_link)
+                    else:
+                        log_callback("\n[!] NO DOWNLOAD LINK FOUND.")
+                        
+                    log_callback("="*50)
+                    status_callback("SUCCESS - Email Read!")
+                else:
+                    log_callback("Mailbox empty.")
+                    status_callback("Empty Inbox")
+            elif resp.status_code == 403:
+                log_callback(f"ACCESS DENIED (403): {resp.text}")
+                log_callback("Ensure you ran the PowerShell 'New-ApplicationAccessPolicy' command!")
+                status_callback("Access Denied")
             else:
-                log_callback("Mailbox empty.")
-                status_callback("Empty Inbox")
-        else:
-            log_callback(f"API Error: {resp.text}")
-            status_callback("API Error")
+                log_callback(f"API Error {resp.status_code}: {resp.text}")
+                status_callback("API Error")
+                
+        except Exception as e:
+            log_callback(f"Connection Error: {e}")
+            status_callback("Connection Error")
 
     else:
+        # Error handling for token failure
         status_callback("Auth Failed")
-        log_callback("Could not acquire token.")
+        log_callback(f"Could not acquire token: {result.get('error')}")
+        log_callback(f"Desc: {result.get('error_description')}")
 # =============================================================================
 # GUI SETUP
 # =============================================================================
@@ -331,7 +299,7 @@ class App:
         e_frame = ttk.LabelFrame(main, text="2. Shared Mailbox Access", padding=10)
         e_frame.pack(fill=tk.X, pady=10)
         
-        ttk.Label(e_frame, text=f"Admin: {CONFIG['ADMIN_EMAIL']}  |  Target: {CONFIG['TARGET_MAILBOX']}").pack(anchor=tk.W)
+        ttk.Label(e_frame, text=f"Scanning Target: {CONFIG['TARGET_MAILBOX']}").pack(anchor=tk.W)
         
         self.btn_email = ttk.Button(e_frame, text="Validate Mailbox Access", command=self._run_email)
         self.btn_email.pack(anchor=tk.W, pady=5)
