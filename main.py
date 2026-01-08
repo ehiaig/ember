@@ -107,64 +107,99 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         log_callback("\nScanning for Findox Login...")
         
         email_filled = False
+        login_submitted = False  # Track if form was successfully submitted
         
         for i in range(120): # 2 mins
             if download_status["success"]: break
             
+            # Check if we're on a login page - reset email_filled if we are and haven't submitted
+            current_url = page.url.lower()
+            is_on_login_page = "login" in current_url or "signin" in current_url or "auth" in current_url
+            
+            # Reset email_filled if we're back on login page (e.g., after redirect) and form wasn't submitted
+            if is_on_login_page and not login_submitted:
+                email_filled = False
+            
             if not email_filled:
                 try:
+                    # Wait a moment for page to stabilize after redirects
+                    page.wait_for_timeout(500)
+                    
                     # PRIORITY 1: The "Golden Ticket" Selector (from your HTML)
                     target = page.query_selector("[data-cy='step1-email-input']")
                     
                     # PRIORITY 2: Fallback
                     if not target:
                         target = page.query_selector("input[name='username']")
+                    
+                    # PRIORITY 3: Additional fallbacks for common login forms
+                    if not target:
+                        target = page.query_selector("input[type='email']")
+                    if not target:
+                        target = page.query_selector("input#email")
 
                     # EXECUTE TYPING
-                    if target and target.is_visible() and not target.input_value():
-                        log_callback("Found Input (Vue.js detected).")
-                        
-                        target.click()
-                        target.fill("") 
-                        
-                        # 1. Type with rhythm to wake up Vue
-                        log_callback("Typing email...")
-                        target.press_sequentially(CONFIG["CLIENT_EMAIL"], delay=100)
-                        
-                        # 2. THE TRICK: Space + Backspace 
-                        # This forces Vue to re-validate that the field is dirty/valid
-                        page.wait_for_timeout(500)
-                        target.press("Space")
-                        page.wait_for_timeout(100)
-                        target.press("Backspace")
-                        
-                        # 3. Trigger Blur
-                        target.blur() 
-                        page.wait_for_timeout(1000)
-                        
-                        email_filled = True
-                        
-                        # 4. Handle the "Disabled" Button
-                        # We look for the button specifically by your new ID
-                        btn = page.query_selector("[data-cy='step1-next-button']")
-                        
-                        if btn and btn.is_visible():
-                            # Check if it is still disabled
-                            is_disabled = btn.get_attribute("disabled") is not None
+                    if target and target.is_visible():
+                        current_value = target.input_value()
+                        # Fill if empty OR if it doesn't contain our email yet
+                        if not current_value or CONFIG["CLIENT_EMAIL"] not in current_value:
+                            log_callback("Found Input (Vue.js detected).")
                             
-                            if is_disabled:
-                                log_callback("Button is disabled. Sending ENTER key fallback...")
-                                target.focus()
-                                target.press("Enter")
+                            target.click()
+                            target.fill("") 
+                            
+                            # 1. Type with rhythm to wake up Vue
+                            log_callback(f"Typing email: {CONFIG['CLIENT_EMAIL']}")
+                            target.press_sequentially(CONFIG["CLIENT_EMAIL"], delay=100)
+                            
+                            # 2. THE TRICK: Space + Backspace 
+                            # This forces Vue to re-validate that the field is dirty/valid
+                            page.wait_for_timeout(500)
+                            target.press("Space")
+                            page.wait_for_timeout(100)
+                            target.press("Backspace")
+                            
+                            # 3. Trigger Blur
+                            target.blur() 
+                            page.wait_for_timeout(1000)
+                            
+                            email_filled = True
+                            
+                            # 4. Handle the "Disabled" Button
+                            # We look for the button specifically by your new ID
+                            btn = page.query_selector("[data-cy='step1-next-button']")
+                            
+                            # Also try common submit button selectors
+                            if not btn or not btn.is_visible():
+                                btn = page.query_selector("button[type='submit']")
+                            if not btn or not btn.is_visible():
+                                btn = page.query_selector("button:has-text('Continue')")
+                            if not btn or not btn.is_visible():
+                                btn = page.query_selector("button:has-text('Next')")
+                            
+                            if btn and btn.is_visible():
+                                # Check if it is still disabled
+                                is_disabled = btn.get_attribute("disabled") is not None
+                                
+                                if is_disabled:
+                                    log_callback("Button is disabled. Sending ENTER key fallback...")
+                                    target.focus()
+                                    target.press("Enter")
+                                else:
+                                    log_callback("Button is ENABLED. Clicking...")
+                                    btn.click()
+                                login_submitted = True
                             else:
-                                log_callback("Button is ENABLED. Clicking...")
-                                btn.click()
-                        else:
-                            # Fallback if button not found
-                            target.press("Enter")
+                                # Fallback if button not found
+                                log_callback("No button found. Pressing Enter...")
+                                target.press("Enter")
+                                login_submitted = True
+                            
+                            # Wait for potential redirect after login submission
+                            page.wait_for_timeout(2000)
 
                 except Exception as e:
-                    pass
+                    log_callback(f"Login attempt error: {e}")
 
             # Smart Retry (if stuck on dashboard but no download)
             if not download_status["success"] and i > 25:
