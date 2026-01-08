@@ -2,10 +2,8 @@
 EvergreenPipeline Validation Spike
 =======================================
 A standalone tool to validate:
-1. Browser Automation (Bypassing Intune/SSO & capturing Mimecast downloads)
-2. Shared Mailbox Access (via Graph API Device Code Flow)
-
-Developed for Windows Enterprise Environments.
+1. Browser Automation (Persistent Profile + Auto-Retry + Auto-Fill)
+2. Shared Mailbox Access (App-Only via Graph API)
 """
 import os
 import sys
@@ -18,26 +16,22 @@ from tkinter import messagebox, scrolledtext, ttk
 # CONFIGURATION
 # =============================================================================
 CONFIG = {
-    # Base URLs
-    "BASE_URL": "https://findox.com",
-    "LOGIN_URL": "https://findox.com/login",
-
-    "STATE_FILE": "browser_state.json",
     "DOWNLOAD_DIR": "downloads",
-
-    "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
 
     # --- EMAIL SETTINGS ---
     "TARGET_MAILBOX": "samco@emberapp.io",
+    
+    # NEW: Client Email for Auto-fill
+    "CLIENT_EMAIL": "ryan@schorecliffam.com",
 
-    # Microsoft Graph (Azure CLI Public Client - Safe for Enterprise)
-    "MS_CLIENT_ID": "",
-    "MS_TENANT_ID": "",
-    "MS_CLIENT_SECRET_VALUE": ""
+    # Microsoft Graph (Confidential Client - App Only)
+    "MS_CLIENT_ID": "",           # <--- PASTE ID HERE
+    "MS_TENANT_ID": "",           # <--- PASTE TENANT ID HERE
+    "MS_CLIENT_SECRET_VALUE": ""  # <--- PASTE SECRET HERE
 }
 
 # =============================================================================
-# BROWSER LOGIC (UPDATED: Persistent Profile)
+# BROWSER LOGIC (FIXED: Stable Profile + Auto-Fill)
 # =============================================================================
 def run_browser_validation(test_url, log_callback, status_callback, save_session_callback):
     try:
@@ -49,33 +43,31 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
     status_callback("Initializing Browser...")
     log_callback("="*50)
     log_callback("BROWSER VALIDATION STARTED")
-    log_callback("Mode: Persistent Profile (Intune Compliance)")
-    log_callback(f"Target URL: {test_url}")
-    log_callback("="*50)
     
-    # Path setup
+    # --- PATH FIX: Use AppData for stability ---
     try:
-        # Determine paths
+        # 1. Download Path (Local to EXE)
         if getattr(sys, 'frozen', False):
             base_path = Path(sys.executable).parent
         else:
             base_path = Path.cwd()
-
         download_dir = (base_path / CONFIG["DOWNLOAD_DIR"]).absolute()
         download_dir.mkdir(parents=True, exist_ok=True)
+
+        # 2. Profile Path (Stable AppData Location)
+        # This ensures cookies persist even if you move the EXE or download a new version
+        app_data = Path(os.getenv('LOCALAPPDATA')) / "EvergreenPipeline"
+        profile_dir = (app_data / "edge_profile").absolute()
+        profile_dir.mkdir(parents=True, exist_ok=True)
         
-        # NEW: Persistent Profile Directory
-        # This folder will store the "Signed In" state of the browser itself
-        profile_dir = (base_path / "edge_profile").absolute()
-        log_callback(f"Profile Path: {profile_dir}")
+        log_callback(f"Stable Profile Path: {profile_dir}")
+        log_callback("(This profile persists across app updates)")
         
     except Exception as e:
         log_callback(f"Path Error: {e}")
         return
 
     with sync_playwright() as p:
-        # LAUNCH ARGS: Make it look like a real user's browser, not a bot
-        # This helps bypass "AutomationControlled" flags that trigger stricter policies
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
@@ -83,11 +75,9 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
             "--password-store=basic",
         ]
 
-        log_callback("Launching Edge with Persistent Profile...")
+        log_callback("Launching Edge...")
         
         try:
-            # SWITCH TO: launch_persistent_context
-            # This is the key fix. It creates a permanent user data folder.
             context = p.chromium.launch_persistent_context(
                 user_data_dir=str(profile_dir),
                 channel="msedge" if os.name == 'nt' else "chrome",
@@ -95,25 +85,23 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
                 args=launch_args,
                 viewport={"width": 1280, "height": 800},
                 accept_downloads=True,
-                # Try to ignore the 'Chrome is being controlled by automation' banner
                 ignore_default_args=["--enable-automation"] 
             )
         except Exception as e:
             log_callback(f"Launch Failed: {e}")
-            log_callback("Try closing all other Edge windows and running again.")
+            log_callback("CRITICAL: Close all existing Edge windows and try again.")
             return
 
-        # Persistent contexts open a page by default
         page = context.pages[0] if context.pages else context.new_page()
         
-        # Setup Download Listener
+        # --- DOWNLOAD LISTENER ---
         download_status = {"success": False, "path": None}
         def on_download(download):
             try:
-                log_callback(f"\nDownload Detected! Filename: {download.suggested_filename}")
+                log_callback(f"\n[+] DOWNLOAD STARTED: {download.suggested_filename}")
                 f_path = download_dir / download.suggested_filename
                 download.save_as(str(f_path))
-                log_callback(f"Saved to: {f_path}")
+                log_callback(f"[+] SAVED TO: {f_path}")
                 download_status["success"] = True
                 download_status["path"] = str(f_path)
             except Exception as e:
@@ -123,26 +111,57 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         
         # --- NAVIGATION ---
         log_callback(f"\nNavigating to: {test_url}")
-        log_callback("NOTE: If you see 'Sign in to Edge', please do so.")
-        log_callback("We need the browser to be 'Managed' to download the file.")
-        
         try:
             page.goto(test_url, wait_until="domcontentloaded", timeout=60000)
-        except Exception as e:
-            log_callback(f"Navigation note: {e}")
+        except:
+            pass # Ignore timeouts, we handle logic in the loop
 
-        # --- WAIT LOOP ---
-        # We wait longer now to allow him to handle the "Switch Profile" or Login prompts
-        log_callback("\nWaiting for download...")
-        log_callback("If stuck on login screens, please complete them manually.")
+        # --- SMART LOOP: Auto-Fill & Retry Logic ---
+        log_callback("\nProcessing Page...")
         
-        # Wait up to 3 minutes for user to fight through the login screens
-        for i in range(180): 
+        # We assume if we are on these URLs, we are NOT logged in yet
+        login_keywords = ["login", "signin", "auth"]
+        
+        # Flag to track if we tried re-triggering the download
+        download_retried = False
+
+        for i in range(120): # Wait up to 2 minutes
             if download_status["success"]:
                 break
-            if i % 10 == 0:
-                # Keep session alive
-                page.wait_for_timeout(100)
+            
+            current_url = page.url.lower()
+            
+            # 1. AUTO-FILL EMAIL (If input detected)
+            try:
+                # Look for typical email fields if we haven't filled them yet
+                email_field = page.query_selector("input[type='email'], input[name='email'], input[id*='email']")
+                if email_field and email_field.is_visible() and not email_field.input_value():
+                    log_callback(f"Auto-filling email: {CONFIG['CLIENT_EMAIL']}")
+                    email_field.fill(CONFIG["CLIENT_EMAIL"])
+                    page.wait_for_timeout(500)
+                    
+                    # Try to click Continue/Next
+                    btn = page.query_selector("button:has-text('Continue'), button:has-text('Next'), button[type='submit']")
+                    if btn:
+                        log_callback("Clicking Continue...")
+                        btn.click()
+            except:
+                pass # Ignore errors here, just keep checking
+
+            # 2. SMART RETRY (Issue #2 Fix)
+            # If we are NOT on a login page, but download hasn't started, force the link again.
+            is_login_page = any(k in current_url for k in login_keywords)
+            
+            if not is_login_page and not download_status["success"] and not download_retried and i > 5:
+                # We waited 5 ticks, we are not on login page, implies we are logged in.
+                log_callback("\n[!] Login appears complete, but no download yet.")
+                log_callback("[!] Re-triggering download link automatically...")
+                try:
+                    page.goto(test_url)
+                    download_retried = True
+                except:
+                    pass
+
             page.wait_for_timeout(1000)
             
         if download_status["success"]:
@@ -152,17 +171,16 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
             log_callback("="*50)
             messagebox.showinfo("Success", "File Downloaded Successfully!")
         else:
-            status_callback("Inconclusive - No file yet")
-            log_callback("\nTimed out waiting for download.")
-            log_callback("Browser will remain open for manual testing...")
-            page.wait_for_timeout(30000) # Keep open for 30s more
+            status_callback("Inconclusive")
+            log_callback("\nTimed out. Please check if file downloaded manually.")
 
         try:
             context.close()
         except:
             pass
+
 # =============================================================================
-# EMAIL LOGIC WITH "REMEMBER ME" (Token Caching)
+# EMAIL LOGIC (SHARED MAILBOX - APP ONLY)
 # =============================================================================
 def run_email_validation(password, log_callback, status_callback, code_callback):
     import re
@@ -175,8 +193,7 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
     log_callback(f"Target Inbox: {CONFIG['TARGET_MAILBOX']}")
     log_callback("="*50)
 
-    # 1. Setup Confidential Client (Service Principal)
-    # We use ConfidentialClientApplication instead of PublicClientApplication
+    # 1. Setup Confidential Client
     app = msal.ConfidentialClientApplication(
         CONFIG["MS_CLIENT_ID"],
         authority=f"https://login.microsoftonline.com/{CONFIG['MS_TENANT_ID']}",
@@ -184,16 +201,12 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
     )
 
     # 2. Acquire Token
-    # The scope is always '.default' for App-Only flows. 
-    # This tells Azure: "Give me all permissions (Mail.Read) defined in the portal."
     result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
 
     if "access_token" in result:
         log_callback("Auth Success! Accessing mailbox as Service...")
         
-        # 3. Query Message
         headers = {"Authorization": f"Bearer {result['access_token']}"}
-        # Note: We query /users/{target}/messages directly
         endpoint = f"https://graph.microsoft.com/v1.0/users/{CONFIG['TARGET_MAILBOX']}/messages?$top=1&$select=subject,from,body"
         
         try:
@@ -209,7 +222,7 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
                     log_callback("\n" + "="*50)
                     log_callback(f"Subject: {subject}")
                     
-                    # --- REGEX LOGIC (Preserved from your original code) ---
+                    # Regex for Findox/Mimecast
                     match_perfect = re.search(r'href=[\"\'](https?://[^\"\']*findox\.com[^\"\']*download=true[^\"\']*)[\"\']', body_content, re.IGNORECASE)
                     
                     found_link = None
@@ -228,11 +241,8 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
                                 log_callback("\n[+] MATCH: Found link next to '(Web)' label.")
 
                     if found_link:
-                        # Clean HTML entities
                         found_link = found_link.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
                         log_callback(f"Extracted URL: {found_link}")
-                        log_callback("Auto-filling Browser Input...")
-                        # Pass to GUI
                         code_callback(None, None, subject, found_link)
                     else:
                         log_callback("\n[!] NO DOWNLOAD LINK FOUND.")
@@ -244,7 +254,6 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
                     status_callback("Empty Inbox")
             elif resp.status_code == 403:
                 log_callback(f"ACCESS DENIED (403): {resp.text}")
-                log_callback("Ensure you ran the PowerShell 'New-ApplicationAccessPolicy' command!")
                 status_callback("Access Denied")
             else:
                 log_callback(f"API Error {resp.status_code}: {resp.text}")
@@ -255,10 +264,9 @@ def run_email_validation(password, log_callback, status_callback, code_callback)
             status_callback("Connection Error")
 
     else:
-        # Error handling for token failure
         status_callback("Auth Failed")
         log_callback(f"Could not acquire token: {result.get('error')}")
-        log_callback(f"Desc: {result.get('error_description')}")
+
 # =============================================================================
 # GUI SETUP
 # =============================================================================
@@ -267,20 +275,16 @@ class App:
         self.root = root
         self.root.title("Evergreen Pipeline")
         self.root.geometry("750x650")
-        
         self.browser_ctx = None
-        self.state_file = None
-        
         self._ui()
         
     def _ui(self):
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
         
-        # Header
         ttk.Label(main, text="Milestone 1 Validation Tool", font=("Segoe UI", 14, "bold")).pack(pady=5)
         
-        # --- SECTION 1: BROWSER ---
+        # BROWSER SECTION
         b_frame = ttk.LabelFrame(main, text="1. Browser & Download", padding=10)
         b_frame.pack(fill=tk.X, pady=5)
         
@@ -288,29 +292,22 @@ class App:
         self.url_var = tk.StringVar()
         ttk.Entry(b_frame, textvariable=self.url_var, width=70).pack(fill=tk.X, pady=5)
         
-        btn_box = ttk.Frame(b_frame)
-        btn_box.pack(fill=tk.X)
-        self.btn_browser = ttk.Button(btn_box, text="Launch Browser Test", command=self._run_browser)
-        self.btn_browser.pack(side=tk.LEFT, padx=5)
-        self.btn_save = ttk.Button(btn_box, text="Save Session", state=tk.DISABLED, command=self._save)
-        self.btn_save.pack(side=tk.LEFT, padx=5)
+        self.btn_browser = ttk.Button(b_frame, text="Launch Browser Test", command=self._run_browser)
+        self.btn_browser.pack(anchor=tk.W, pady=5)
 
-        # --- SECTION 2: EMAIL ---
+        # EMAIL SECTION
         e_frame = ttk.LabelFrame(main, text="2. Shared Mailbox Access", padding=10)
         e_frame.pack(fill=tk.X, pady=10)
         
         ttk.Label(e_frame, text=f"Scanning Target: {CONFIG['TARGET_MAILBOX']}").pack(anchor=tk.W)
-        
         self.btn_email = ttk.Button(e_frame, text="Validate Mailbox Access", command=self._run_email)
         self.btn_email.pack(anchor=tk.W, pady=5)
         
-        # --- OUTPUT ---
+        # OUTPUT
         self.status = tk.StringVar(value="Ready")
         ttk.Label(main, textvariable=self.status, foreground="blue", font=("Segoe UI", 10)).pack()
-        
         self.code_lbl = ttk.Label(main, text="", foreground="red", font=("Consolas", 12))
         self.code_lbl.pack()
-        
         self.log = scrolledtext.ScrolledText(main, height=12, font=("Consolas", 9))
         self.log.pack(fill=tk.BOTH, expand=True)
 
@@ -325,39 +322,19 @@ class App:
         def _do():
             if subject: 
                 self.code_lbl.config(text=f"Last Email: {subject}", foreground="green")
-                # AUTO-FILL THE INPUT FIELD
                 if extracted_link:
                     self.url_var.set(extracted_link)
-            elif code: 
-                self.code_lbl.config(text=f"CODE: {code}  (Enter at {url})", foreground="red")
-            else: 
-                self.code_lbl.config(text="")
         self.root.after(0, _do)
-
-    def _enable_save(self, enable, ctx=None, f=None, l=None):
-        def _do():
-            if enable:
-                self.browser_ctx = ctx
-                self.state_file = f
-                self.btn_save.config(state=tk.NORMAL)
-            else:
-                self.btn_save.config(state=tk.DISABLED)
-        self.root.after(0, _do)
-
-    def _save(self):
-        if self.browser_ctx:
-            self.browser_ctx.storage_state(path=str(self.state_file))
-            self._log(f"Session Saved to {self.state_file}")
-            messagebox.showinfo("Saved", "Session captured! You can now re-run to test auto-download.")
 
     def _run_browser(self):
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showwarning("Missing URL", "Please paste the Mimecast/Findox link from the email first.")
+            messagebox.showwarning("Missing URL", "Please paste the URL first.")
             return
         
         self.btn_browser.config(state=tk.DISABLED)
-        threading.Thread(target=run_browser_validation, args=(url, self._log, self._status_upd, self._enable_save), daemon=True).start()
+        # Pass None for save_callback as we removed the manual save button (auto-save is better)
+        threading.Thread(target=run_browser_validation, args=(url, self._log, self._status_upd, None), daemon=True).start()
         self.root.after(3000, lambda: self.btn_browser.config(state=tk.NORMAL))
 
     def _run_email(self):
