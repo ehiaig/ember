@@ -22,7 +22,7 @@ CONFIG = {
     "TARGET_MAILBOX": "samco@emberapp.io",
     
     # NEW: Client Email for Auto-fill
-    "CLIENT_EMAIL": "ryan@schorecliffam.com",
+    "CLIENT_EMAIL": "ryan@shorecliffam.com",
 
     # Microsoft Graph (Confidential Client - App Only)
     "MS_CLIENT_ID": "",           # <--- PASTE ID HERE
@@ -31,7 +31,7 @@ CONFIG = {
 }
 
 # =============================================================================
-# BROWSER LOGIC (FIXED: Compatibility with all Playwright versions)
+# BROWSER LOGIC (FIXED: Tightened Login Detection + Re-trigger)
 # =============================================================================
 def run_browser_validation(test_url, log_callback, status_callback, save_session_callback):
     try:
@@ -108,83 +108,102 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         
         email_filled = False
         login_submitted = False
+        download_retriggered = False
+        
+        # Login page detection should be narrow; SSO/SAML implies post-login redirects
+        login_keywords = ["login", "signin", "auth", "logon"]
+        post_login_keywords = ["sso", "saml", "oauth", "verify", "identify"]
         
         for i in range(120): # 2 mins
             if download_status["success"]: break
             
-            # Reset state if we bounced back to login page
+            # 1. Determine State
             current_url = page.url.lower()
-            is_on_login_page = "login" in current_url or "signin" in current_url
+            is_on_login_page = any(k in current_url for k in login_keywords)
+            is_post_login = any(k in current_url for k in post_login_keywords)
+            
+            # Reset if we bounced back to login
             if is_on_login_page and not login_submitted:
                 email_filled = False
             
-            if not email_filled:
+            # 2. AUTO-FILL LOGIC
+            if not email_filled and is_on_login_page:
                 try:
                     page.wait_for_timeout(500)
-                    
-                    # PRIORITY 1: Cypress Selector (Best)
                     target = page.query_selector("[data-cy='step1-email-input']")
-                    
-                    # Fallbacks
                     if not target: target = page.query_selector("input[name='username']")
                     if not target: target = page.query_selector("input[type='email']")
-                    if not target: target = page.query_selector("input#email")
 
                     if target and target.is_visible():
                         current_val = target.input_value()
                         if not current_val or CONFIG["CLIENT_EMAIL"] not in current_val:
                             log_callback("Found Input. Auto-filling...")
-                            
                             target.click()
                             target.fill("") 
                             
-                            # --- THE FIX IS HERE ---
-                            # Replaced 'press_sequentially' with 'type'
-                            log_callback(f"Typing email: {CONFIG['CLIENT_EMAIL']}")
+                            log_callback(f"Typing email...")
                             target.type(CONFIG["CLIENT_EMAIL"], delay=100)
-                            # -----------------------
 
-                            # The "Wake Up Vue" Trick
-                            page.wait_for_timeout(500)
+                            # Wake Up Vue
+                            page.wait_for_timeout(200)
                             target.press("Space")
                             page.wait_for_timeout(100)
                             target.press("Backspace")
-                            
                             target.blur() 
                             page.wait_for_timeout(1000)
                             
                             email_filled = True
                             
-                            # Handle Button
+                            # Click Continue
                             btn = page.query_selector("[data-cy='step1-next-button']")
-                            if not btn or not btn.is_visible():
+                            if not btn: 
                                 btn = page.query_selector("button:has-text('Continue')")
-                            
+
                             if btn and btn.is_visible():
-                                if btn.get_attribute("disabled") is not None:
-                                    log_callback("Button disabled. Using Enter key...")
-                                    target.focus()
-                                    target.press("Enter")
-                                else:
-                                    log_callback("Clicking Continue...")
+                                log_callback("Waiting for button to enable...")
+                                for _ in range(25): 
+                                    if btn.get_attribute("disabled") is None: break
+                                    page.wait_for_timeout(200)
+                                
+                                if btn.get_attribute("disabled") is None:
+                                    log_callback("Button Enabled! Clicking...")
                                     btn.click()
+                                else:
+                                    log_callback("Button stuck. Force clicking...")
+                                    btn.click(force=True)
                                 login_submitted = True
                             else:
-                                log_callback("No button. Using Enter key...")
+                                log_callback("No button. Sending Enter...")
+                                target.focus()
                                 target.press("Enter")
                                 login_submitted = True
                             
                             page.wait_for_timeout(2000)
 
                 except Exception as e:
-                    # This will catch other errors, but the 'type' error should be gone
                     log_callback(f"Auto-fill error: {e}")
 
-            # Smart Retry (Refresh if stuck)
-            if not download_status["success"] and i > 25:
-                if "login" not in page.url.lower() and i % 10 == 0:
-                    try: page.reload()
+            # 3. CRITICAL: RE-TRIGGER DOWNLOAD
+            # Only trigger if:
+            #   a) No download yet
+            #   b) We are DEFINITELY NOT on a login page (url check)
+            #   c) We have waited > 15 seconds (to allow redirects to settle)
+            if not download_status["success"] and not is_on_login_page and i > 15:
+                if not download_retriggered:
+                    if is_post_login:
+                        log_callback("\n[!] SSO redirect detected. Re-visiting download URL...")
+                    else:
+                        log_callback("\n[!] Login appears complete (No login keywords in URL).")
+                    log_callback("[!] Re-visiting download URL to capture file...")
+                    try:
+                        page.goto(test_url)
+                        download_retriggered = True
                     except: pass
+                elif i % 15 == 0:
+                     # If we tried once and it failed, retry every 15 ticks
+                     log_callback("Still waiting... Refreshing page.")
+                     try: page.reload()
+                     except: pass
 
             page.wait_for_timeout(1000)
             
