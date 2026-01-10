@@ -45,7 +45,7 @@ def _ensure_browser_context(profile_dir, log_callback):
         if _browser_context and not _browser_context.is_closed():
             if _browser_context.pages:
                 _browser_page = _browser_context.pages[0]
-            elif _browser_page is None:
+            else:
                 _browser_page = _browser_context.new_page()
             return _browser_context, _browser_page
     except Exception:
@@ -161,25 +161,25 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
         _download_handler = on_download
         page.on("download", _download_handler)
 
-    def _log_goto_response(resp, label):
-        try:
-            if not resp:
-                log_callback(f"{label}: no response")
-                return
-            ctype = resp.headers.get("content-type", "")
-            cdisp = resp.headers.get("content-disposition", "")
-            log_callback(f"{label}: {resp.status} {resp.url}")
-            if ctype or cdisp:
-                log_callback(f"{label} headers: content-type='{ctype}' content-disposition='{cdisp}'")
-        except Exception:
-            pass
+        def _log_goto_response(resp, label):
+            try:
+                if not resp:
+                    log_callback(f"{label}: no response")
+                    return
+                ctype = resp.headers.get("content-type", "")
+                cdisp = resp.headers.get("content-disposition", "")
+                log_callback(f"{label}: {resp.status} {resp.url}")
+                if ctype or cdisp:
+                    log_callback(f"{label} headers: content-type='{ctype}' content-disposition='{cdisp}'")
+            except Exception:
+                pass
 
-    log_callback(f"\nNavigating to: {test_url}")
-    try:
-        resp = page.goto(test_url, wait_until="domcontentloaded", timeout=60000)
-        _log_goto_response(resp, "Initial goto")
-    except Exception as e:
-        log_callback(f"Initial goto error: {e}")
+        log_callback(f"\nNavigating to: {test_url}")
+        try:
+            resp = page.goto(test_url, wait_until="domcontentloaded", timeout=60000)
+            _log_goto_response(resp, "Initial goto")
+        except Exception as e:
+            log_callback(f"Initial goto error: {e}")
 
         log_callback("\nScanning for Findox Login...")
 
@@ -293,9 +293,9 @@ def run_browser_validation(test_url, log_callback, status_callback, save_session
                     except Exception as e:
                         log_callback(f"Post-login re-trigger error: {e}")
                 elif i % 15 == 0:
-                     # If we tried once and it failed, retry every 15 ticks
-                     log_callback("Still waiting... Refreshing page.")
-                     try:
+                    # If we tried once and it failed, retry every 15 ticks
+                    log_callback("Still waiting... Refreshing page.")
+                    try:
                         page.reload()
                     except Exception:
                         pass
