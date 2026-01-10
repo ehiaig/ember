@@ -1,0 +1,401 @@
+"""
+EvergreenPipeline Validation Spike
+=======================================
+A standalone tool to validate:
+1. Browser Automation (Persistent Profile + Long-Lived Session)
+2. Shared Mailbox Access (App-Only via Graph API)
+"""
+import os
+import sys
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox, scrolledtext, ttk
+
+from playwright.sync_api import sync_playwright
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+CONFIG = {
+    "DOWNLOAD_DIR": "downloads",
+    "TARGET_MAILBOX": "samco@emberapp.io",
+    
+    # !!! VERIFY THIS EMAIL IS CORRECT !!!
+    "CLIENT_EMAIL": "ryan@shorecliffam.com", 
+    
+    # Microsoft Graph (Confidential Client - App Only)
+    "MS_CLIENT_ID": "",           # <--- PASTE ID
+    "MS_TENANT_ID": "",           # <--- PASTE TENANT
+    "MS_CLIENT_SECRET_VALUE": ""  # <--- PASTE SECRET
+}
+
+# =============================================================================
+# GLOBAL STATE (THE LONG-LIVED BROWSER)
+# =============================================================================
+# This variable keeps the browser alive as long as the App is running.
+GLOBAL_PLAYWRIGHT = None
+GLOBAL_BROWSER_CONTEXT = None
+BROWSER_LOCK = threading.Lock()
+
+def get_or_create_browser(log_callback):
+    """
+    Returns an existing browser instance or creates a new one.
+    This ensures we reuse the same session cookies (RAM) and profile (Disk).
+    """
+    global GLOBAL_PLAYWRIGHT, GLOBAL_BROWSER_CONTEXT
+    
+    with BROWSER_LOCK:
+        if GLOBAL_BROWSER_CONTEXT is not None:
+            try:
+                # Check if browser is still alive
+                GLOBAL_BROWSER_CONTEXT.pages
+                return GLOBAL_BROWSER_CONTEXT
+            except:
+                log_callback("Browser was closed manually. Restarting...")
+                GLOBAL_BROWSER_CONTEXT = None
+
+        log_callback("Initializing Long-Lived Browser Session...")
+        
+        # Path Setup for Persistence
+        if getattr(sys, 'frozen', False):
+            base_path = Path(sys.executable).parent
+        else:
+            base_path = Path.cwd()
+            
+        app_data = Path(os.getenv('LOCALAPPDATA')) / "EvergreenPipeline"
+        profile_dir = (app_data / "edge_profile").absolute()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize Playwright (Once per app lifetime)
+        if GLOBAL_PLAYWRIGHT is None:
+            GLOBAL_PLAYWRIGHT = sync_playwright().start()
+            
+        launch_args = [
+            "--disable-blink-features=AutomationControlled", 
+            "--no-first-run",
+            "--password-store=basic"
+        ]
+
+        try:
+            # Persistent Context: Saves cookies to disk AND keeps them in RAM
+            GLOBAL_BROWSER_CONTEXT = GLOBAL_PLAYWRIGHT.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                channel="msedge" if os.name == 'nt' else "chrome",
+                headless=False, # Visible for validation confidence
+                args=launch_args,
+                viewport={"width": 1280, "height": 800},
+                accept_downloads=True,
+                ignore_default_args=["--enable-automation"]
+            )
+            log_callback(f"Browser Launched. Profile: {profile_dir}")
+            return GLOBAL_BROWSER_CONTEXT
+        except Exception as e:
+            log_callback(f"FATAL: Could not launch browser: {e}")
+            return None
+
+# =============================================================================
+# BROWSER LOGIC (MODIFIED: REUSE EXISTING BROWSER + RE-TRIGGER)
+# =============================================================================
+def run_browser_validation(test_url, log_callback, status_callback):
+    status_callback("Acquiring Browser...")
+    
+    context = get_or_create_browser(log_callback)
+    if not context:
+        status_callback("Browser Failed")
+        return
+
+    # Create a NEW PAGE (Tab) for this specific download attempt
+    page = context.new_page()
+    status_callback("Tab Opened")
+    log_callback("="*50)
+    
+    # Download Setup
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path.cwd()
+    download_dir = (base_path / CONFIG["DOWNLOAD_DIR"]).absolute()
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    download_status = {"success": False}
+    def on_download(download):
+        try:
+            log_callback(f"\n[+] DOWNLOAD STARTED: {download.suggested_filename}")
+            f_path = download_dir / download.suggested_filename
+            download.save_as(str(f_path))
+            download_status["success"] = True
+            log_callback("[+] File Saved Successfully.")
+        except: pass
+    page.on("download", on_download)
+    
+    # 1. INITIAL NAVIGATION
+    log_callback(f"Navigating to: {test_url}")
+    try:
+        page.goto(test_url, wait_until="domcontentloaded", timeout=60000)
+    except: pass 
+
+    # --- SMART LOOP ---
+    email_filled = False
+    login_submitted = False
+    download_retriggered = False
+    
+    login_keywords = ["login", "signin", "auth", "logon"]
+    post_login_keywords = ["sso", "saml", "oauth", "verify", "identify"]
+    
+    for i in range(120): # 2 mins max
+        # If download started, we are done!
+        if download_status["success"]: break
+        
+        current_url = page.url.lower()
+        is_on_login_page = any(k in current_url for k in login_keywords)
+        is_post_login = any(k in current_url for k in post_login_keywords)
+        
+        # Reset auto-fill if we somehow bounced back to the start
+        if is_on_login_page and not login_submitted:
+            email_filled = False
+        
+        # 2. AUTO-FILL LOGIC (Only runs if we are stuck on a login screen)
+        if not email_filled and is_on_login_page:
+            try:
+                page.wait_for_timeout(500)
+                target = page.query_selector("[data-cy='step1-email-input']")
+                if not target: target = page.query_selector("input[name='username']")
+                if not target: target = page.query_selector("input[type='email']")
+
+                if target and target.is_visible():
+                    current_val = target.input_value()
+                    if not current_val or CONFIG["CLIENT_EMAIL"] not in current_val:
+                        log_callback("Login Screen Detected. Auto-filling...")
+                        target.click()
+                        target.fill("") 
+                        target.type(CONFIG["CLIENT_EMAIL"], delay=100)
+                        
+                        # Vue.js Wake Up
+                        page.wait_for_timeout(200)
+                        target.press("Space"); page.wait_for_timeout(50); target.press("Backspace")
+                        target.blur() 
+                        page.wait_for_timeout(1000)
+                        email_filled = True
+                        
+                        # Click Continue
+                        btn = page.query_selector("[data-cy='step1-next-button']")
+                        if not btn: btn = page.query_selector("button:has-text('Continue')")
+
+                        if btn and btn.is_visible():
+                            for _ in range(25): 
+                                if btn.get_attribute("disabled") is None: break
+                                page.wait_for_timeout(200)
+                            if btn.get_attribute("disabled") is None:
+                                btn.click()
+                            else:
+                                btn.click(force=True)
+                            login_submitted = True
+                        else:
+                            target.focus(); target.press("Enter")
+                            login_submitted = True
+                        page.wait_for_timeout(2000)
+            except: pass
+
+        # 3. RE-TRIGGER LOGIC (The Safety Net)
+        # If we are NOT on a login page, but we STILL don't have the file...
+        # It means we are on the Dashboard (either from fresh login or existing session).
+        # We wait 15 seconds to let any natural redirects finish, then we force it.
+        if not download_status["success"] and not is_on_login_page and i > 15:
+            if not download_retriggered:
+                if is_post_login: log_callback("\n[!] SSO/Post-Login Detected.")
+                else: log_callback("\n[!] Session Active (Dashboard Detected).")
+                
+                log_callback("Triggering Download URL again...")
+                try:
+                    page.goto(test_url)
+                    download_retriggered = True
+                except: pass
+            elif i % 15 == 0:
+                 # Backup: If the re-trigger failed, refresh every 15s
+                 try: page.reload()
+                 except: pass
+
+        page.wait_for_timeout(1000)
+        
+    if download_status["success"]:
+        status_callback("SUCCESS!")
+        messagebox.showinfo("Success", "File Downloaded!")
+    else:
+        status_callback("Inconclusive")
+        log_callback("Timed out.")
+
+    # IMPORTANT: Close the TAB, but keep the BROWSER (Context) alive.
+    try:
+        page.close()
+        status_callback("Tab Closed (Session Alive)")
+    except: pass
+
+# =============================================================================
+# EMAIL LOGIC (UNCHANGED)
+# =============================================================================
+def run_email_validation(password, log_callback, status_callback, code_callback):
+    import re
+
+    import msal
+    import requests
+
+    status_callback("Authenticating (App-Only)...")
+    log_callback("="*50)
+    log_callback(f"Target Inbox: {CONFIG['TARGET_MAILBOX']}")
+    
+    try:
+        if not CONFIG["MS_CLIENT_ID"] or not CONFIG["MS_CLIENT_SECRET_VALUE"]:
+             raise ValueError("Missing Credentials! Check CONFIG.")
+
+        app = msal.ConfidentialClientApplication(
+            CONFIG["MS_CLIENT_ID"],
+            authority=f"https://login.microsoftonline.com/{CONFIG['MS_TENANT_ID']}",
+            client_credential=CONFIG["MS_CLIENT_SECRET_VALUE"]
+        )
+        result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+
+        if "access_token" in result:
+            log_callback("Auth Success! Accessing mailbox...")
+            headers = {"Authorization": f"Bearer {result['access_token']}"}
+            endpoint = f"https://graph.microsoft.com/v1.0/users/{CONFIG['TARGET_MAILBOX']}/messages?$top=1&$select=subject,from,body"
+            resp = requests.get(endpoint, headers=headers)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("value"):
+                    email = data["value"][0]
+                    subject = email.get('subject')
+                    body_content = email.get('body', {}).get('content', '')
+                    
+                    log_callback("\n" + "="*50)
+                    log_callback(f"Subject: {subject}")
+                    
+                    match_perfect = re.search(r'href=[\"\'](https?://[^\"\']*findox\.com[^\"\']*download=true[^\"\']*)[\"\']', body_content, re.IGNORECASE)
+                    
+                    found_link = None
+                    if match_perfect:
+                        found_link = match_perfect.group(1)
+                        log_callback("[+] MATCH: Found exact 'findox' link.")
+                    else:
+                        match_mime = re.search(r'href=[\"\'](https?://[^\"\']*mimecastprotect\.com[^\"\']*)[\"\']', body_content, re.IGNORECASE)
+                        if match_mime:
+                            found_link = match_mime.group(1)
+                            log_callback("[+] MATCH: Found Mimecast Redirect.")
+                        else:
+                            match_prox = re.search(r"href=[\"']([^\"']+)[\"'].{1,300}?\(Web\)", body_content, re.IGNORECASE | re.DOTALL)
+                            if match_prox:
+                                found_link = match_prox.group(1)
+                                log_callback("[+] MATCH: Found link next to '(Web)' label.")
+
+                    if found_link:
+                        found_link = found_link.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                        log_callback(f"URL: {found_link}")
+                        code_callback(None, None, subject, found_link)
+                    else:
+                        log_callback("[!] NO DOWNLOAD LINK FOUND.")
+                    
+                    status_callback("Email Read!")
+                else:
+                    log_callback("Mailbox empty.")
+                    status_callback("Empty Inbox")
+            else:
+                log_callback(f"API Error {resp.status_code}")
+                status_callback("API Error")
+        else:
+             status_callback("Auth Failed")
+             log_callback(f"Token Error: {result.get('error')}")
+
+    except Exception as e:
+        log_callback(f"Connection Error: {e}")
+        status_callback("Connection Error")
+
+# =============================================================================
+# GUI SETUP (CLEANUP ON EXIT)
+# =============================================================================
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("EvergreenPipeline Validation Tool")
+        self.root.geometry("750x650")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._ui()
+        
+    def _ui(self):
+        main = ttk.Frame(self.root, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(main, text="Milestone 1: Production Logic Spike", font=("Segoe UI", 14, "bold")).pack(pady=5)
+        
+        # BROWSER
+        b_frame = ttk.LabelFrame(main, text="1. Browser & Download (Long-Lived Session)", padding=10)
+        b_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(b_frame, text="Paste Download URL (from Email):").pack(anchor=tk.W)
+        self.url_var = tk.StringVar()
+        ttk.Entry(b_frame, textvariable=self.url_var, width=70).pack(fill=tk.X, pady=5)
+        
+        self.btn_browser = ttk.Button(b_frame, text="Launch Browser (Maintains Session)", command=self._run_browser)
+        self.btn_browser.pack(anchor=tk.W, pady=5)
+
+        # EMAIL
+        e_frame = ttk.LabelFrame(main, text="2. Shared Mailbox Access", padding=10)
+        e_frame.pack(fill=tk.X, pady=10)
+        
+        ttk.Label(e_frame, text=f"Scanning: {CONFIG['TARGET_MAILBOX']}").pack(anchor=tk.W)
+        self.btn_email = ttk.Button(e_frame, text="Scan Mailbox", command=self._run_email)
+        self.btn_email.pack(anchor=tk.W, pady=5)
+        
+        # OUTPUT
+        self.status = tk.StringVar(value="Ready")
+        ttk.Label(main, textvariable=self.status, foreground="blue", font=("Segoe UI", 10)).pack()
+        self.code_lbl = ttk.Label(main, text="", foreground="red", font=("Consolas", 12))
+        self.code_lbl.pack()
+        self.log = scrolledtext.ScrolledText(main, height=12, font=("Consolas", 9))
+        self.log.pack(fill=tk.BOTH, expand=True)
+
+    def _log(self, msg):
+        self.root.after(0, lambda: self.log.insert(tk.END, msg + "\n"))
+        self.root.after(0, lambda: self.log.see(tk.END))
+
+    def _status_upd(self, msg):
+        self.root.after(0, lambda: self.status.set(msg))
+
+    def _code_upd(self, code, url, subject=None, extracted_link=None):
+        def _do():
+            if subject: 
+                self.code_lbl.config(text=f"Last Email: {subject}", foreground="green")
+                if extracted_link:
+                    self.url_var.set(extracted_link)
+        self.root.after(0, _do)
+
+    def _run_browser(self):
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL", "Please paste the URL first.")
+            return
+        
+        self.btn_browser.config(state=tk.DISABLED)
+        threading.Thread(target=run_browser_validation, args=(url, self._log, self._status_upd), daemon=True).start()
+        self.root.after(2000, lambda: self.btn_browser.config(state=tk.NORMAL))
+
+    def _run_email(self):
+        self.btn_email.config(state=tk.DISABLED)
+        threading.Thread(target=run_email_validation, args=("", self._log, self._status_upd, self._code_upd), daemon=True).start()
+        self.root.after(3000, lambda: self.btn_email.config(state=tk.NORMAL))
+
+    def _on_close(self):
+        """Cleanup browser on App Close"""
+        global GLOBAL_PLAYWRIGHT, GLOBAL_BROWSER_CONTEXT
+        try:
+            if GLOBAL_BROWSER_CONTEXT:
+                GLOBAL_BROWSER_CONTEXT.close()
+            if GLOBAL_PLAYWRIGHT:
+                GLOBAL_PLAYWRIGHT.stop()
+        except: pass
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
