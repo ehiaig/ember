@@ -21,6 +21,8 @@ from playwright.sync_api import sync_playwright
 CONFIG = {
     "DOWNLOAD_DIR": "downloads",
     "TARGET_MAILBOX": "samco@emberapp.io",
+    
+    # !!! VERIFY THIS EMAIL IS CORRECT !!!
     "CLIENT_EMAIL": "ryan@shorecliffam.com", 
     
     # Microsoft Graph (Confidential Client - App Only)
