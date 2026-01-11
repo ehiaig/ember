@@ -423,9 +423,16 @@ class App:
             return
         
         self.btn_browser.config(state=tk.DISABLED)
-        threading.Thread(target=run_browser_validation, args=(url, self._log, self._status_upd), daemon=True).start()
-        self.root.after(2000, lambda: self.btn_browser.config(state=tk.NORMAL))
 
+        def _worker():
+            try:
+                run_browser_validation(url, self._log, self._status_upd)
+            finally:
+                self.root.after(0, lambda: self.btn_browser.config(state=tk.NORMAL))
+
+        # Start the thread
+        threading.Thread(target=_worker, daemon=True).start()
+        
     def _run_email(self):
         self.btn_email.config(state=tk.DISABLED)
         threading.Thread(target=run_email_validation, args=("", self._log, self._status_upd, self._code_upd), daemon=True).start()
